@@ -6,39 +6,44 @@ import os
 import json
 import sys
 import linecache
-import pdb
 
 import torch
 from torch import nn, optim
-from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.nn import init
 import numpy as np
-# from tensorboardX import SummaryWriter
+from tensorboardX import SummaryWriter
+from seqeval.metrics import f1_score, precision_score, recall_score
 
 parser = argparse.ArgumentParser(description='PyTorch BiLSTM+CRF Sequence Labeling')
-parser.add_argument('--batch-size', type=int, default=1, metavar='N',
-                    help='input batch size for training (default: 64)')
+parser.add_argument('--model-name', type=str, default='model', metavar='S',
+                    help='model name')
+parser.add_argument('--batch-size', type=int, default=64, metavar='N',
+                    help='input batch size for training')
+parser.add_argument('--test-batch-size', type=int, default=5, metavar='N',
+                    help='test batch size')
 parser.add_argument('--epochs', type=int, default=50, metavar='N',
-                    help='number of epochs to train (default: 50)')
-parser.add_argument('--embedding-size', type=int, default=64, metavar='N',
-                    help='embedding size(default: 64)')
-parser.add_argument('--hidden-size', type=int, default=256, metavar='N',
-                    help='hidden size(default: 256)')
+                    help='number of epochs to train')
+parser.add_argument('--embedding-size', type=int, default=512, metavar='N',
+                    help='embedding size')
+parser.add_argument('--hidden-size', type=int, default=1024, metavar='N',
+                    help='hidden size')
 parser.add_argument('--rnn-layer', type=int, default=1, metavar='N',
                     help='RNN layer num')
 parser.add_argument('--dropout', type=float, default=0, metavar='RATE',
                     help='dropout rate')
 parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
-                    help='learning rate (default: 0.001)')
+                    help='learning rate')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
-                    help='random seed (default: 1)')
-parser.add_argument('--save-interval', type=int, default=10, metavar='N',
-                    help='how many batches to wait before checkpointing')
-parser.add_argument('--resume', action='store_true', default=False,
-                    help='resume training from checkpoint')
+                    help='random seed')
+parser.add_argument('--save-interval', type=int, default=30, metavar='N',
+                    help='save interval')
+parser.add_argument('--valid-interval', type=int, default=30, metavar='N',
+                    help='valid interval')
+parser.add_argument('--log-interval', type=int, default=10, metavar='N',
+                    help='log interval')
 parser.add_argument('--vocab', nargs='+', required=True, metavar='SRC_VOCAB TGT_VOCAB',
                     help='src vocab and tgt vocab')
 parser.add_argument('--trainset', type=str, default=os.path.join('data', 'train.csv'), metavar='TRAINSET',
@@ -48,13 +53,29 @@ parser.add_argument('--testset', type=str, default=os.path.join('data', 'test.cs
 
 START_TAG = "<START_TAG>"
 END_TAG = "<END_TAG>"
+O = "O"
+BLOC = "B-LOC"
+ILOC = "I-LOC"
+BORG = "B-ORG"
+IORG = "I-ORG"
+BPER = "B-PER"
+IPER = "I-PER"
 PAD = "<PAD>"
+UNK = "<UNK>"
 token2idx = {
-  PAD: 0
+  PAD: 0,
+  UNK: 1
 }
 tag2idx = {
   START_TAG: 0,
-  END_TAG: 1
+  END_TAG: 1,
+  O: 2,
+  BLOC: 3,
+  ILOC: 4,
+  BORG: 5,
+  IORG: 6,
+  BPER: 7,
+  IPER: 8
 }
 
 def log_sum_exp(tensor: torch.Tensor,
@@ -85,14 +106,14 @@ class CRFLayer(nn.Module):
     super(CRFLayer, self).__init__()
     # transition[i][j] means transition probability from j to i
     self.transition = nn.Parameter(torch.randn(tag_size, tag_size))
-    # initialize START_TAG, END_TAG probability in log space
-    self.transition[tag2idx[START_TAG], :] = -10000
-    self.transition[:, tag2idx[END_TAG]] = -10000
-    
+
     self.reset_parameters()
 
   def reset_parameters(self):
-    init.normal_(self.transition.data)
+    init.normal_(self.transition)
+    # initialize START_TAG, END_TAG probability in log space
+    self.transition.detach()[tag2idx[START_TAG], :] = -10000
+    self.transition.detach()[:, tag2idx[END_TAG]] = -10000
   
   def forward(self, feats, mask):
     """
@@ -104,11 +125,10 @@ class CRFLayer(nn.Module):
     """
     seq_len, batch_size, tag_size = feats.size()
     # initialize alpha to zero in log space
-    alpha = torch.full((batch_size, tag_size), -10000)
+    alpha = feats.new_full((batch_size, tag_size), fill_value=-10000)
     # alpha in START_TAG is 1
     alpha[:, tag2idx[START_TAG]] = 0
-
-    for i, feat in enumerate(feats):
+    for t, feat in enumerate(feats):
       # broadcast dimension: (batch_size, next_tag, current_tag)
       # emit_score is the same regardless of current_tag, so we broadcast along current_tag
       emit_score = feat.unsqueeze(-1) # (batch_size, tag_size, 1)
@@ -118,7 +138,8 @@ class CRFLayer(nn.Module):
       alpha_score = alpha.unsqueeze(1) # (batch_size, 1, tag_size)
       alpha_score = alpha_score + transition_score + emit_score
       # log_sum_exp along current_tag dimension to get next_tag alpha
-      alpha = log_sum_exp(alpha_score, -1) * mask[i] + alpha * (1 - mask[i]) # (batch_size, tag_size)
+      mask_t = mask[t].unsqueeze(-1)
+      alpha = log_sum_exp(alpha_score, -1) * mask_t + alpha * (1 - mask_t) # (batch_size, tag_size)
     # arrive at END_TAG
     alpha = alpha + self.transition[tag2idx[END_TAG]].unsqueeze(0)
 
@@ -134,12 +155,12 @@ class CRFLayer(nn.Module):
       scores: (batch_size, )
     """
     seq_len, batch_size, tag_size = feats.size()
-    scores = torch.zeros(batch_size)
-    tags = torch.cat([torch.full((1, batch_size), tag2idx[START_TAG], dtype=torch.long), tags], 0) # (seq_len + 1, batch_size)
-    for i, feat in enumerate(feats):
-      emit_score = torch.stack([f[next_tag] for f, next_tag in zip(feat, tags[i + 1])])
-      transition_score = torch.stack([self.transition[tags[i + 1, b], tags[i, b]] for b in range(batch_size)])
-      scores += (emit_score + transition_score) * mask[i]
+    scores = feats.new_zeros(batch_size)
+    tags = torch.cat([tags.new_full((1, batch_size), fill_value=tag2idx[START_TAG]), tags], 0) # (seq_len + 1, batch_size)
+    for t, feat in enumerate(feats):
+      emit_score = torch.stack([f[next_tag] for f, next_tag in zip(feat, tags[t + 1])])
+      transition_score = torch.stack([self.transition[tags[t + 1, b], tags[t, b]] for b in range(batch_size)])
+      scores += (emit_score + transition_score) * mask[t]
     transition_to_end = torch.stack([self.transition[tag2idx[END_TAG], tag[mask[:, b].sum().long()]] for b, tag in enumerate(tags.transpose(0, 1))])
     scores += transition_to_end
     return scores
@@ -152,30 +173,30 @@ class CRFLayer(nn.Module):
     """
     seq_len, batch_size, tag_size = feats.size()
     # initialize scores in log space
-    scores = torch.fill((batch_size, tag_size), -10000)
+    scores = feats.new_full((batch_size, tag_size), fill_value=-10000)
     scores[:, tag2idx[START_TAG]] = 0
     pointers = []
     # forward
-    for i, feat in enumerate(feats):
+    for t, feat in enumerate(feats):
       # broadcast dimension: (batch_size, next_tag, current_tag)
       scores_t = scores.unsqueeze(1) + self.transition.unsqueeze(0)  # (batch_size, tag_size, tag_size)
       # max along current_tag to obtain: next_tag score, current_tag pointer
       scores_t, pointer = torch.max(scores_t, -1)  # (batch_size, tag_size), (batch_size, tag_size)
       scores_t += feat
       pointers.append(pointer)
-      mask_t = mask[i].unsqueeze(-1)  # (batch_size, 1)
+      mask_t = mask[t].unsqueeze(-1)  # (batch_size, 1)
       scores = scores_t * mask_t + scores * mask_t
-    # pointers should be list with shape (seq_len, batch_size, tag_size)
+    pointers = torch.stack(pointers, 0) # (seq_len, batch_size, tag_size)
     scores += self.transition[tag2idx[END_TAG]].unsqueeze(0)
     best_score, best_tag = torch.max(scores, -1)  # (batch_size, ), (batch_size, )
     # backtracking
     best_path = best_tag.unsqueeze(-1).tolist() # list shape (batch_size, 1)
     for i in range(batch_size):
       best_tag_i = best_tag[i]
-      seq_len_i = mask[:, i].sum()
-      for ptr_t in reversed(pointers[:seq_len_i][i]):
+      seq_len_i = int(mask[:, i].sum())
+      for ptr_t in reversed(pointers[:seq_len_i, i]):
         # ptr_t shape (tag_size, )
-        best_tag_i = ptr_t[best_tag_i]
+        best_tag_i = ptr_t[best_tag_i].item()
         best_path[i].append(best_tag_i)
       # pop first tag
       best_path[i].pop()
@@ -198,8 +219,6 @@ class BiLSTMCRF(nn.Module):
     self.reset_parameters()
 
   def reset_parameters(self):
-    self.crf.reset_parameters()
-    self.bilstm.reset_parameters()
     init.xavier_normal_(self.embedding.weight)
     init.xavier_normal_(self.hidden2tag.weight)
 
@@ -215,10 +234,10 @@ class BiLSTMCRF(nn.Module):
     gold_score = self.crf.score_sentence(lstm_features, tags, mask)
     return forward_score - gold_score
 
-  def predict(self, seq):
-    lstm_features = self.get_lstm_features(seq)
-    score, prediction = self.crf.viterbi_decode(lstm_features)
-    return score, prediction
+  def predict(self, seq, mask):
+    lstm_features = self.get_lstm_features(seq, mask)
+    best_path = self.crf.viterbi_decode(lstm_features, mask)
+    return best_path
 
 class SequenceLabelingDataset(Dataset):
   def __init__(self, filename):
@@ -227,7 +246,7 @@ class SequenceLabelingDataset(Dataset):
       self._lines_count = len(f.readlines())
 
   def __getitem__(self, idx):
-    line = linecache.getline(self._filename, idx)
+    line = linecache.getline(self._filename, idx + 1)
     return line.strip().split(",")
 
   def __len__(self):
@@ -240,6 +259,9 @@ def main(args):
   global token2idx
   global tag2idx
 
+  tb_writer = SummaryWriter(args.model_name)
+
+  print("Args: {}".format(args))
   use_cuda = torch.cuda.is_available() and not args.no_cuda
   device = torch.device('cuda' if use_cuda else 'cpu')
   torch.manual_seed(args.seed)
@@ -269,38 +291,88 @@ def main(args):
       json.dump(token2idx, fp, ensure_ascii=False)
     with open(args.vocab[1], "w", encoding="utf-8") as fp:
       json.dump(tag2idx, fp)
+  idx2tag = {}
+  for k, v in tag2idx.items():
+    idx2tag[v] = k
 
+  print("Loading data")
   trainset = SequenceLabelingDataset(args.trainset)
   testset = SequenceLabelingDataset(args.testset)
   trainset_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=1, pin_memory=True)
-  testset_loader = DataLoader(testset, batch_size=args.batch_size, shuffle=True, num_workers=1, pin_memory=True)
+  testset_loader = DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, num_workers=1, pin_memory=True)
 
+  print("Building model")
   model = BiLSTMCRF(len(token2idx), len(tag2idx), args.embedding_size, args.hidden_size, args.rnn_layer, args.dropout).to(device)
+  print(model)
   optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
+  print("Start training")
   model.train()
   step = 0
 
   def _prepare_data(samples, vocab, pad, device=None):
-    samples = list(map(lambda s: s.replace(" ", ""), samples))
+    samples = list(map(lambda s: s.strip().split(" "), samples))
     batch_size = len(samples)
     sizes = [len(s) for s in samples]
     max_size = max(sizes)
     x_np = np.full((batch_size, max_size), fill_value=vocab[pad], dtype='int64')
     for i in range(batch_size):
-      x_np[i, :sizes[i]] = [vocab[token] for token in samples[i]]
+      x_np[i, :sizes[i]] = [vocab[token] if token in vocab else vocab[UNK] for token in samples[i]]
     return torch.LongTensor(x_np.T).to(device)
 
+  def _compute_forward(seq, tags, mask):
+    loss = model.neg_log_likelihood(seq, tags, mask).mean()
+    loss.backward()
+    return loss.item()
+
+  def _evaluate():
+    model.eval()
+    hypothesis = []
+    ground_truth = []
+    with torch.no_grad():
+      for bidx, batch in enumerate(testset_loader):
+        seq = _prepare_data(batch[0], token2idx, PAD, device)
+        mask = torch.ne(seq, float(token2idx[PAD])).float()
+        best_path = model.predict(seq, mask)
+        hypothesis.extend([[idx2tag[j] for j in i] for i in best_path])
+        for line in batch[1]:
+          ground_truth.append(line.strip().split(" "))
+
+    # calculate F1 on entity
+    f1 = f1_score(ground_truth, hypothesis)
+    precision = precision_score(ground_truth, hypothesis)
+    recall = recall_score(ground_truth, hypothesis)
+    model.train()
+    return f1, precision, recall
+
+  best_f1 = 0
   for eidx in range(1, args.epochs + 1):
+    print("Start epoch {}".format(eidx))
     for bidx, batch in enumerate(trainset_loader):
       seq = _prepare_data(batch[0], token2idx, PAD, device)
       tags = _prepare_data(batch[1], tag2idx, END_TAG, device)
       mask = torch.ne(seq, float(token2idx[PAD])).float()
       optimizer.zero_grad()
-      loss = model.neg_log_likelihood(seq, tags, mask)
-      loss.backward()
+      loss = _compute_forward(seq, tags, mask)
+      tb_writer.add_scalar("train/loss", loss, step)
+      tb_writer.add_scalar("train/epoch", step, eidx)
       optimizer.step()
       step += 1
+      if step % args.log_interval == 0:
+        print("epoch {} step {} batch {} loss {}".format(eidx, step, bidx, loss))
+      if step % args.valid_interval == 0:
+        f1, precision, recall = _evaluate()
+        tb_writer.add_scalar("eval/f1", f1, step)
+        tb_writer.add_scalar("eval/precision", precision, step)
+        tb_writer.add_scalar("eval/recall", recall, step)
+        print("[valid] epoch {} step {} f1 {} precision {} recall {}".format(eidx, step, f1, precision, recall))
+        if f1 > best_f1:
+          best_f1 = f1
+          torch.save(model.state_dict(), os.path.join(args.model_name, "best.model"))
+          torch.save(optimizer.state_dict(), os.path.join(args.model_name, "best.optimizer"))
+      if step % args.save_interval == 0:
+        torch.save(model.state_dict(), os.path.join(args.model_name, "newest.model"))
+        torch.save(optimizer.state_dict(), os.path.join(args.model_name, "newest.optimizer"))
 
 if __name__ == "__main__":
   main(parser.parse_args())
