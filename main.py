@@ -6,11 +6,13 @@ import os
 import json
 import sys
 import linecache
+import pdb
 
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, Dataset
 from torch.nn import init
+from allennlp.modules.conditional_random_field import ConditionalRandomField as CRF
 import numpy as np
 from tensorboardX import SummaryWriter
 from seqeval.metrics import f1_score, precision_score, recall_score
@@ -20,7 +22,7 @@ parser.add_argument('--model-name', type=str, default='model', metavar='S',
                     help='model name')
 parser.add_argument('--batch-size', type=int, default=64, metavar='N',
                     help='input batch size for training')
-parser.add_argument('--test-batch-size', type=int, default=5, metavar='N',
+parser.add_argument('--test-batch-size', type=int, default=20, metavar='N',
                     help='test batch size')
 parser.add_argument('--epochs', type=int, default=50, metavar='N',
                     help='number of epochs to train')
@@ -30,20 +32,24 @@ parser.add_argument('--hidden-size', type=int, default=1024, metavar='N',
                     help='hidden size')
 parser.add_argument('--rnn-layer', type=int, default=1, metavar='N',
                     help='RNN layer num')
+parser.add_argument('--with-layer-norm', action='store_true', default=False,
+                    help='whether to add layer norm after RNN')
 parser.add_argument('--dropout', type=float, default=0, metavar='RATE',
                     help='dropout rate')
 parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
                     help='learning rate')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
-parser.add_argument('--seed', type=int, default=1, metavar='S',
+parser.add_argument('--seed', type=int, default=1234, metavar='S',
                     help='random seed')
 parser.add_argument('--save-interval', type=int, default=30, metavar='N',
                     help='save interval')
-parser.add_argument('--valid-interval', type=int, default=30, metavar='N',
+parser.add_argument('--valid-interval', type=int, default=60, metavar='N',
                     help='valid interval')
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='log interval')
+parser.add_argument('--patience', type=int, default=30, metavar='N',
+                    help='patience for early stop')
 parser.add_argument('--vocab', nargs='+', required=True, metavar='SRC_VOCAB TGT_VOCAB',
                     help='src vocab and tgt vocab')
 parser.add_argument('--trainset', type=str, default=os.path.join('data', 'train.csv'), metavar='TRAINSET',
@@ -114,7 +120,7 @@ class CRFLayer(nn.Module):
     # initialize START_TAG, END_TAG probability in log space
     self.transition.detach()[tag2idx[START_TAG], :] = -10000
     self.transition.detach()[:, tag2idx[END_TAG]] = -10000
-  
+
   def forward(self, feats, mask):
     """
     Arg:
@@ -185,7 +191,7 @@ class CRFLayer(nn.Module):
       scores_t += feat
       pointers.append(pointer)
       mask_t = mask[t].unsqueeze(-1)  # (batch_size, 1)
-      scores = scores_t * mask_t + scores * mask_t
+      scores = scores_t * mask_t + scores * (1 - mask_t)
     pointers = torch.stack(pointers, 0) # (seq_len, batch_size, tag_size)
     scores += self.transition[tag2idx[END_TAG]].unsqueeze(0)
     best_score, best_tag = torch.max(scores, -1)  # (batch_size, ), (batch_size, )
@@ -205,17 +211,22 @@ class CRFLayer(nn.Module):
     return best_path
 
 class BiLSTMCRF(nn.Module):
-  def __init__(self, vocab_size, tag_size, embedding_size, hidden_size, num_layers, dropout):
+  def __init__(self, vocab_size, tag_size, embedding_size, hidden_size, num_layers, dropout, with_ln):
     super(BiLSTMCRF, self).__init__()
     self.embedding = nn.Embedding(vocab_size, embedding_size, padding_idx=token2idx[PAD])
+    self.dropout = nn.Dropout(dropout)
     self.bilstm = nn.LSTM(input_size=embedding_size,
                           hidden_size=hidden_size,
                           num_layers=num_layers,
                           dropout=dropout,
                           bidirectional=True)
+    self.with_ln = with_ln
+    if with_ln:
+      self.layer_norm = nn.LayerNorm(hidden_size)
     self.hidden2tag = nn.Linear(hidden_size * 2, tag_size)
-    self.crf = CRFLayer(tag_size)
-    
+    #self.crf = CRFLayer(tag_size)
+    self.crf = CRF(tag_size)
+
     self.reset_parameters()
 
   def reset_parameters(self):
@@ -223,21 +234,41 @@ class BiLSTMCRF(nn.Module):
     init.xavier_normal_(self.hidden2tag.weight)
 
   def get_lstm_features(self, seq, mask):
+    """
+    :param seq: (seq_len, batch_size)
+    :param mask: (seq_len, batch_size)
+    """
     embed = self.embedding(seq) # (seq_len, batch_size, embedding_size)
+    embed = self.dropout(embed)
     lstm_output, _ = self.bilstm(embed) # (seq_len, batch_size, hidden_size)
-    lstm_features = self.hidden2tag(lstm_output) * mask[:, :, None]  # (seq_len, batch_size, tag_size)
+    lstm_output = lstm_output * mask.unsqueeze(-1)
+    if self.with_ln:
+      lstm_output = self.layer_norm(lstm_output)
+    lstm_features = self.hidden2tag(lstm_output) * mask.unsqueeze(-1)  # (seq_len, batch_size, tag_size)
     return lstm_features
 
   def neg_log_likelihood(self, seq, tags, mask):
+    """
+    :param seq: (seq_len, batch_size)
+    :param tags: (seq_len, batch_size)
+    :param mask: (seq_len, batch_size)
+    """
     lstm_features = self.get_lstm_features(seq, mask)
-    forward_score = self.crf(lstm_features, mask)
-    gold_score = self.crf.score_sentence(lstm_features, tags, mask)
-    return forward_score - gold_score
+    #forward_score = self.crf(lstm_features, mask)
+    #gold_score = self.crf.score_sentence(lstm_features, tags, mask)
+    neg_log_likelihood = -self.crf(lstm_features.transpose(0, 1), tags.transpose(0, 1), mask.transpose(0, 1))
+    return neg_log_likelihood
 
   def predict(self, seq, mask):
+    """
+    :param seq: (seq_len, batch_size)
+    :param mask: (seq_len, batch_size)
+    """
     lstm_features = self.get_lstm_features(seq, mask)
-    best_path = self.crf.viterbi_decode(lstm_features, mask)
-    return best_path
+    #best_path = self.crf.viterbi_decode(lstm_features, mask)
+    #return best_path
+    best_paths = self.crf.viterbi_tags(lstm_features.transpose(0, 1), mask.transpose(0, 1).long())
+    return best_paths
 
 class SequenceLabelingDataset(Dataset):
   def __init__(self, filename):
@@ -298,11 +329,12 @@ def main(args):
   print("Loading data")
   trainset = SequenceLabelingDataset(args.trainset)
   testset = SequenceLabelingDataset(args.testset)
-  trainset_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=1, pin_memory=True)
-  testset_loader = DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, num_workers=1, pin_memory=True)
+  trainset_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+  testset_loader = DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
   print("Building model")
-  model = BiLSTMCRF(len(token2idx), len(tag2idx), args.embedding_size, args.hidden_size, args.rnn_layer, args.dropout).to(device)
+  model = BiLSTMCRF(len(token2idx), len(tag2idx), args.embedding_size, args.hidden_size, args.rnn_layer, args.dropout,
+          args.with_layer_norm).to(device)
   print(model)
   optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
@@ -321,7 +353,9 @@ def main(args):
     return torch.LongTensor(x_np.T).to(device)
 
   def _compute_forward(seq, tags, mask):
-    loss = model.neg_log_likelihood(seq, tags, mask).mean()
+    loss = model.neg_log_likelihood(seq, tags, mask)
+    batch_size = seq.size(1)
+    loss /= batch_size
     loss.backward()
     return loss.item()
 
@@ -334,7 +368,7 @@ def main(args):
         seq = _prepare_data(batch[0], token2idx, PAD, device)
         mask = torch.ne(seq, float(token2idx[PAD])).float()
         best_path = model.predict(seq, mask)
-        hypothesis.extend([[idx2tag[j] for j in i] for i in best_path])
+        hypothesis.extend([[idx2tag[j] for j in i[0]] for i in best_path])
         for line in batch[1]:
           ground_truth.append(line.strip().split(" "))
 
@@ -346,7 +380,12 @@ def main(args):
     return f1, precision, recall
 
   best_f1 = 0
+  patience = 0
+  early_stop = False
   for eidx in range(1, args.epochs + 1):
+    if early_stop:
+      print("Early stop. epoch {} step {} best f1 {}".format(eidx, step, best_f1))
+      sys.exit(0)
     print("Start epoch {}".format(eidx))
     for bidx, batch in enumerate(trainset_loader):
       seq = _prepare_data(batch[0], token2idx, PAD, device)
@@ -360,6 +399,9 @@ def main(args):
       step += 1
       if step % args.log_interval == 0:
         print("epoch {} step {} batch {} loss {}".format(eidx, step, bidx, loss))
+      if step % args.save_interval == 0:
+        torch.save(model.state_dict(), os.path.join(args.model_name, "newest.model"))
+        torch.save(optimizer.state_dict(), os.path.join(args.model_name, "newest.optimizer"))
       if step % args.valid_interval == 0:
         f1, precision, recall = _evaluate()
         tb_writer.add_scalar("eval/f1", f1, step)
@@ -367,12 +409,14 @@ def main(args):
         tb_writer.add_scalar("eval/recall", recall, step)
         print("[valid] epoch {} step {} f1 {} precision {} recall {}".format(eidx, step, f1, precision, recall))
         if f1 > best_f1:
+          patience = 0
           best_f1 = f1
           torch.save(model.state_dict(), os.path.join(args.model_name, "best.model"))
           torch.save(optimizer.state_dict(), os.path.join(args.model_name, "best.optimizer"))
-      if step % args.save_interval == 0:
-        torch.save(model.state_dict(), os.path.join(args.model_name, "newest.model"))
-        torch.save(optimizer.state_dict(), os.path.join(args.model_name, "newest.optimizer"))
+        else:
+          patience += 1
+          if patience == args.patience:
+            early_stop = True
 
 if __name__ == "__main__":
   main(parser.parse_args())
