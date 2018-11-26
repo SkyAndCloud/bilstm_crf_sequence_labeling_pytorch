@@ -6,6 +6,5 @@ mkdir train3 && python main.py --model-name train3 --vocab token2idx.json tag2id
 mkdir train4 && python main.py --model-name train4 --vocab token2idx.json tag2idx.json --dropout 0.1 2>&1 | tee train4/log
 mkdir train5 && python main.py --model-name train5 --vocab token2idx.json tag2idx.json --dropout 0.3 2>&1 | tee train5/log
 mkdir train6 && python main.py --model-name train6 --vocab token2idx.json tag2idx.json --dropout 0.5 2>&1 | tee train6/log
-mkdir train6 && python main.py --model-name train6 --vocab token2idx.json tag2idx.json --dropout 0.5 2>&1 | tee train6/log
 mkdir train7 && python main.py --model-name train7 --vocab token2idx.json tag2idx.json --rnn-layer 2 2>&1 | tee train7/log
 mkdir train8 && python main.py --model-name train8 --vocab token2idx.json tag2idx.json --with-layer-norm 2 2>&1 | tee train8/log

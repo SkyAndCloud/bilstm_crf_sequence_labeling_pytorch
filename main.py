@@ -12,10 +12,8 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, Dataset
 from torch.nn import init
-from allennlp.modules.conditional_random_field import ConditionalRandomField as CRF
 import numpy as np
 from tensorboardX import SummaryWriter
-from seqeval.metrics import f1_score, precision_score, recall_score
 
 parser = argparse.ArgumentParser(description='PyTorch BiLSTM+CRF Sequence Labeling')
 parser.add_argument('--model-name', type=str, default='model', metavar='S',
@@ -224,8 +222,7 @@ class BiLSTMCRF(nn.Module):
     if with_ln:
       self.layer_norm = nn.LayerNorm(hidden_size)
     self.hidden2tag = nn.Linear(hidden_size * 2, tag_size)
-    #self.crf = CRFLayer(tag_size)
-    self.crf = CRF(tag_size)
+    self.crf = CRFLayer(tag_size)
 
     self.reset_parameters()
 
@@ -240,7 +237,9 @@ class BiLSTMCRF(nn.Module):
     """
     embed = self.embedding(seq) # (seq_len, batch_size, embedding_size)
     embed = self.dropout(embed)
+    embed = nn.utils.rnn.pack_padded_sequence(embed, mask.sum(0).long())
     lstm_output, _ = self.bilstm(embed) # (seq_len, batch_size, hidden_size)
+    lstm_output, _ = nn.utils.rnn.pad_packed_sequence(lstm_output)
     lstm_output = lstm_output * mask.unsqueeze(-1)
     if self.with_ln:
       lstm_output = self.layer_norm(lstm_output)
@@ -254,10 +253,17 @@ class BiLSTMCRF(nn.Module):
     :param mask: (seq_len, batch_size)
     """
     lstm_features = self.get_lstm_features(seq, mask)
-    #forward_score = self.crf(lstm_features, mask)
-    #gold_score = self.crf.score_sentence(lstm_features, tags, mask)
-    neg_log_likelihood = -self.crf(lstm_features.transpose(0, 1), tags.transpose(0, 1), mask.transpose(0, 1))
-    return neg_log_likelihood
+    forward_score = self.crf(lstm_features, mask)
+    gold_score = self.crf.score_sentence(lstm_features, tags, mask)
+    loss = (forward_score - gold_score).sum()
+    #loss = -self.crf(lstm_features.transpose(0, 1), tags.transpose(0, 1), mask.transpose(0, 1))
+
+    # for bilstm model
+    # log_probs = nn.functional.log_softmax(lstm_features, dim=-1).view(-1, self.tag_size)
+    # tags = tags.view(-1)
+    # loss = nn.functional.nll_loss(log_probs, tags, ignore_index=tag2idx[END_TAG], reduction="sum")
+
+    return loss
 
   def predict(self, seq, mask):
     """
@@ -265,9 +271,14 @@ class BiLSTMCRF(nn.Module):
     :param mask: (seq_len, batch_size)
     """
     lstm_features = self.get_lstm_features(seq, mask)
-    #best_path = self.crf.viterbi_decode(lstm_features, mask)
+    best_paths = self.crf.viterbi_decode(lstm_features, mask)
     #return best_path
-    best_paths = self.crf.viterbi_tags(lstm_features.transpose(0, 1), mask.transpose(0, 1).long())
+    #best_paths = self.crf.viterbi_tags(lstm_features.transpose(0, 1), mask.transpose(0, 1).long())
+
+    # for bilstm model
+    # best_paths = torch.max(lstm_features, -1)[1] * mask.long()
+    # best_paths = best_paths.transpose(0, 1).tolist()
+
     return best_paths
 
 class SequenceLabelingDataset(Dataset):
@@ -325,12 +336,15 @@ def main(args):
   idx2tag = {}
   for k, v in tag2idx.items():
     idx2tag[v] = k
+  idx2token = {}
+  for k, v in token2idx.items():
+    idx2token[v] = k
 
   print("Loading data")
   trainset = SequenceLabelingDataset(args.trainset)
   testset = SequenceLabelingDataset(args.testset)
-  trainset_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-  testset_loader = DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, num_workers=4, pin_memory=True)
+  trainset_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=1, pin_memory=True)
+  testset_loader = DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, num_workers=1, pin_memory=True)
 
   print("Building model")
   model = BiLSTMCRF(len(token2idx), len(tag2idx), args.embedding_size, args.hidden_size, args.rnn_layer, args.dropout,
@@ -360,22 +374,51 @@ def main(args):
     return loss.item()
 
   def _evaluate():
+    def get_entity(tags):
+      entity = []
+      prev_entity = "O"
+      start = -1
+      end = -1
+      for i, tag in enumerate(tags):
+        if tag[0] == "O":
+          if prev_entity != "O":
+            entity.append((start, end))
+          prev_entity = "O"
+        if tag[0] == "B":
+          if prev_entity != "O":
+            entity.append((start, end))
+          prev_entity = tag[2:]
+          start = end = i
+        if tag[0] == "I":
+          if prev_entity == tag[2:]:
+            end = i
+      return entity
+
     model.eval()
-    hypothesis = []
-    ground_truth = []
+    correct_num = 0
+    predict_num = 0
+    truth_num = 0
     with torch.no_grad():
       for bidx, batch in enumerate(testset_loader):
         seq = _prepare_data(batch[0], token2idx, PAD, device)
         mask = torch.ne(seq, float(token2idx[PAD])).float()
+        length = mask.sum(0)
+        _, idx = length.sort(0, descending=True)
+        seq = seq[:, idx]
+        mask = mask[:, idx]
         best_path = model.predict(seq, mask)
-        hypothesis.extend([[idx2tag[j] for j in i[0]] for i in best_path])
-        for line in batch[1]:
-          ground_truth.append(line.strip().split(" "))
-
+        ground_truth = [batch[1][i].strip().split(" ") for i in idx]
+        for hyp, gold in zip(best_path, ground_truth):
+          hyp = list(map(lambda x: idx2tag[x], hyp))
+          predict_entities = get_entity(hyp)
+          gold_entities = get_entity(gold)
+          correct_num += len(set(predict_entities) & set(gold_entities))
+          predict_num += len(set(predict_entities))
+          truth_num += len(set(gold_entities))
     # calculate F1 on entity
-    f1 = f1_score(ground_truth, hypothesis)
-    precision = precision_score(ground_truth, hypothesis)
-    recall = recall_score(ground_truth, hypothesis)
+    precision = correct_num / predict_num if predict_num else 0
+    recall = correct_num / truth_num if truth_num else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0
     model.train()
     return f1, precision, recall
 
@@ -383,6 +426,8 @@ def main(args):
   patience = 0
   early_stop = False
   for eidx in range(1, args.epochs + 1):
+    if eidx == 2:
+      model.debug = True
     if early_stop:
       print("Early stop. epoch {} step {} best f1 {}".format(eidx, step, best_f1))
       sys.exit(0)
@@ -391,6 +436,11 @@ def main(args):
       seq = _prepare_data(batch[0], token2idx, PAD, device)
       tags = _prepare_data(batch[1], tag2idx, END_TAG, device)
       mask = torch.ne(seq, float(token2idx[PAD])).float()
+      length = mask.sum(0)
+      _, idx = length.sort(0, descending=True)
+      seq = seq[:, idx]
+      tags = tags[:, idx]
+      mask = mask[:, idx]
       optimizer.zero_grad()
       loss = _compute_forward(seq, tags, mask)
       tb_writer.add_scalar("train/loss", loss, step)
