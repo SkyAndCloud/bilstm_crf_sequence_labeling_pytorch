@@ -256,12 +256,6 @@ class BiLSTMCRF(nn.Module):
     forward_score = self.crf(lstm_features, mask)
     gold_score = self.crf.score_sentence(lstm_features, tags, mask)
     loss = (forward_score - gold_score).sum()
-    #loss = -self.crf(lstm_features.transpose(0, 1), tags.transpose(0, 1), mask.transpose(0, 1))
-
-    # for bilstm model
-    # log_probs = nn.functional.log_softmax(lstm_features, dim=-1).view(-1, self.tag_size)
-    # tags = tags.view(-1)
-    # loss = nn.functional.nll_loss(log_probs, tags, ignore_index=tag2idx[END_TAG], reduction="sum")
 
     return loss
 
@@ -272,12 +266,6 @@ class BiLSTMCRF(nn.Module):
     """
     lstm_features = self.get_lstm_features(seq, mask)
     best_paths = self.crf.viterbi_decode(lstm_features, mask)
-    #return best_path
-    #best_paths = self.crf.viterbi_tags(lstm_features.transpose(0, 1), mask.transpose(0, 1).long())
-
-    # for bilstm model
-    # best_paths = torch.max(lstm_features, -1)[1] * mask.long()
-    # best_paths = best_paths.transpose(0, 1).tolist()
 
     return best_paths
 
